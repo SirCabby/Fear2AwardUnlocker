@@ -1,0 +1,28 @@
+# ---- Build output ----
+build/
+dist/
+
+# ---- IDEs / editors ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# ---- Local build config (your machine's GAME_DIR) ----
+config.mk
+
+# ---- Python tooling ----
+__pycache__/
+*.py[cod]
+
+# ---- OS junk ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- Misc ----
+*.log
+
+# ---- local profile backups (never commit a save file) ----
+.profile-backup-*/

@@ -1,0 +1,7 @@
+; F.E.A.R. 2 pulls exactly one symbol from LTMemory.dll:
+;   ?GetILTMemory@@YAPAVILTMemory@@XZ   ==   ILTMemory* __cdecl GetILTMemory()
+; That name is MSVC-mangled, and GCC cannot produce it from a C++ declaration
+; (GCC uses Itanium mangling), so we export it by alias from a plain C symbol.
+LIBRARY LTMemory
+EXPORTS
+    ?GetILTMemory@@YAPAVILTMemory@@XZ = proxy_GetILTMemory

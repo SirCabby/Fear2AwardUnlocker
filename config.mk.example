@@ -1,0 +1,8 @@
+# Copy this file to config.mk and set your local path.
+#   cp config.mk.example config.mk
+# config.mk is gitignored, so your personal values never enter the repo.
+
+# Absolute path to your F.E.A.R. 2 folder (the directory containing FEAR2.exe).
+# Windows example:      GAME_DIR := C:/Program Files (x86)/Steam/steamapps/common/FEAR2
+# Linux/Proton example: GAME_DIR := /home/you/.local/share/Steam/steamapps/common/FEAR2
+GAME_DIR := /path/to/your/FEAR2
