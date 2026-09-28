@@ -15,6 +15,10 @@ python3 tools/gen_awards.py --game-dir "$GAME_DIR"          # regenerate src/awa
 python3 tools/gen_awards.py --game-dir "$GAME_DIR" --print   # inspect the award table
 ```
 
+`tests/test_adopt.cpp` runs the D3D9 hooks under Wine with the Steam overlay's way of hooking played
+by the test (build and run commands in its header; `F2AU_ADOPT=1` makes the proxy take the Windows
+path under Wine). See "The panel's hooks on Windows".
+
 **The installed file must be named `LTMemory.dll`, exactly.** That is the spelling in FEAR2.exe's
 import table (`grep -aob 'LTMemory\.dll' FEAR2.exe`), and on a case-sensitive filesystem Wine
 finds that literal name first - it only falls back to a case-insensitive scan when the exact name
@@ -39,6 +43,8 @@ the new build prints before assuming the code is wrong.**
   reorder the array.
 - **Back up before touching a profile.** A malformed `.gps` makes the game reset the *entire*
   profile to defaults, not just awards.
+- **On Windows, no function of the mod's in a vtable another hooker reads** (The panel's hooks on
+  Windows).
 
 ## What the game does
 
@@ -234,6 +240,31 @@ hook patches an import table the mod would then have to restore.
 
 `Disable = overlay,callbacks,achievements` in the ini turns whole subsystems off, which is how the
 above was bisected.
+
+## The panel's hooks on Windows (src/adopt.cpp, overlay.cpp)
+Found with Fear3CabbyCodes on 2026-09-27 (its `CLAUDE.md`, "The panel's hooks on Windows", has the
+whole account, from the Steam overlay's log and `gameoverlayrenderer.dll`'s code). The overlay wraps
+`IDirect3D9` in an object of its own (`IWrapIDirect3D9`) and, inside its `CreateDevice`, hooks the new
+device by writing a jump into whatever function each of these device slots points to at that moment:
+Release 2, CreateAdditionalSwapChain 13, GetSwapChain 14, Reset 16, Present 17, SetGammaRamp 21,
+SetRenderState 57, SetSamplerState 69, PresentEx 121, ResetEx 132 - keeping ONE saved original per
+hook and skipping a slot that is its own detour already. EndScene is not among them; Reset is. With
+the mod's Reset in D3D9's device class vtable (1.0.0), a second `CreateDevice` would take it for the
+overlay's original while the mod's own way on is D3D9's Reset, by then the overlay's detour: the two
+would call each other at the next Reset until the stack ran out. Whether F.E.A.R. 2 ever makes a
+second device is not known (the log names only the first), so this is a risk, not a crash seen.
+Hence, on Windows only (`adopt::enabled()`: not Wine, or `F2AU_ADOPT` in the environment), the device
+the game makes for **its window** (a window of this process made by the thread that loaded the mod -
+`adopt::init` runs in DllMain for that, not on the mod thread) gets a private copy of its vtable
+(192 slots) with the mod's EndScene and Reset, and the hooks call on through the vtable the device
+had, as it is at the time; the class's vtable is left alone. `IDirect3D9::CreateDevice` stays hooked
+in place (the overlay's wrapper object, whose vtable it never reads again). `on_game_exiting()` and
+the detach backstop put the class's functions back into the copy (`adopt::unhook_all`) instead of
+writing a vtable through `g_device`. Under Wine the class vtable is hooked as before. The shutdown
+above is unchanged and exits clean under Wine in every case (`hooks removed cleanly`), unlike the
+Fear3 mods' teardown (which never finished there). `tests/test_adopt.cpp` plays the overlay: 1.0.0
+loops at a second device's Reset (`LOOP`); the fix passes, and the Wine path still takes the class
+hook. Not yet seen in game on Windows.
 
 ## Data tooling
 

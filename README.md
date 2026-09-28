@@ -91,7 +91,7 @@ the log banner and the panel's title bar always report the running build.
 
 ```sh
 make version           # print the current version
-make rev 1.1.0         # set a new version (X.Y.Z only)
+make version 1.1.0     # set a new version (X.Y.Z only)
 make package           # -> dist/Fear2AwardUnlocker_1.1.0.zip
 ```
 

@@ -57,22 +57,7 @@ LONG WINAPI on_exception(EXCEPTION_POINTERS* info) {
 using PurecallFn = void(__cdecl*)();
 PurecallFn g_orig_purecall = nullptr;
 
-void describe(void* addr, char* out, size_t n) {
-  HMODULE owner = nullptr;
-  char path[MAX_PATH] = "?";
-  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                         static_cast<LPCSTR>(addr), &owner) &&
-      owner) {
-    GetModuleFileNameA(owner, path, MAX_PATH);
-    const char* leaf = std::strrchr(path, '\\');
-    std::snprintf(out, n, "%s+0x%X", leaf ? leaf + 1 : path,
-                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(addr) -
-                                        reinterpret_cast<uintptr_t>(owner)));
-  } else {
-    std::snprintf(out, n, "%p (no module)", addr);
-  }
-}
+void describe(const void* addr, char* out, size_t n) { describe_address(addr, out, n); }
 
 void __cdecl hk_purecall() {
   void* caller = __builtin_return_address(0);
@@ -100,6 +85,23 @@ void __cdecl hk_purecall() {
 }
 
 }  // namespace
+
+void describe_address(const void* addr, char* out, size_t n) {
+  HMODULE owner = nullptr;
+  char path[MAX_PATH] = "?";
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         static_cast<LPCSTR>(addr), &owner) &&
+      owner) {
+    GetModuleFileNameA(owner, path, MAX_PATH);
+    const char* leaf = std::strrchr(path, '\\');
+    std::snprintf(out, n, "%s+0x%X", leaf ? leaf + 1 : path,
+                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(addr) -
+                                        reinterpret_cast<uintptr_t>(owner)));
+  } else {
+    std::snprintf(out, n, "%p (no module)", addr);
+  }
+}
 
 void install_purecall_logger() {
   const char* modules[] = {nullptr, "gameclient.dll", "gameserver.dll"};

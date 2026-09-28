@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "adopt.h"
 #include "awards.h"
 #include "hooks.h"
 #include "crash.h"
@@ -131,6 +132,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       resolve_forward();
 
       f2au::install_crash_logger();
+      // Here, not on the mod thread: this is the game's primary thread, the one
+      // that makes its window (adopt::game_window).
+      f2au::adopt::init();
       if (HANDLE t = CreateThread(nullptr, 0, mod_thread, nullptr, 0, nullptr)) CloseHandle(t);
       break;
     }

@@ -13,7 +13,7 @@ CXX      := i686-w64-mingw32-g++
 PROJECT  := Fear2AwardUnlocker
 NAME     := LTMemory
 
-# VERSION holds the single source of truth. Change it with `make rev X.Y.Z`.
+# VERSION holds the single source of truth. Change it with `make version X.Y.Z`.
 VERSION  := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 BUILD    := build
 TARGET   := $(BUILD)/$(NAME).dll
@@ -24,9 +24,12 @@ DEF      := ltmemory.def
 # "don't error if absent", so `make` still builds with no local config.
 -include config.mk
 
-ifneq (,$(filter rev,$(MAKECMDGOALS)))
-REV := $(strip $(filter-out rev,$(MAKECMDGOALS)))
+SETVER_GOALS := version rev
+ifneq (,$(filter $(SETVER_GOALS),$(MAKECMDGOALS)))
+REV := $(strip $(filter-out $(SETVER_GOALS),$(MAKECMDGOALS)))
+ifneq (,$(REV))
 $(eval $(REV):;@:)
+endif
 endif
 
 SRCS := $(wildcard src/*.cpp)
@@ -83,19 +86,19 @@ $(BUILD)/imgui/%.o: $(IMGUI_DIR)/%.cpp | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD) $(BUILD)/imgui/backends
 
-version:
-	@echo $(VERSION)
-
-# `make rev X.Y.Z` - set the version.
+# `make version` prints the version; `make version X.Y.Z` sets it (`rev` is the
+# older spelling of the same thing).
 #
 # Make has no argument syntax, so the new version arrives as a second goal. The
-# block below defines a do-nothing target for it so make does not fail trying to
-# build "1.2.3". It is scoped to invocations that actually asked for `rev`: a
-# global match-anything rule would silently swallow mistyped target names.
-rev:
+# block near the top defines a do-nothing target for it so make does not fail
+# trying to build "1.2.3". It is scoped to invocations that actually asked for
+# `version` or `rev`: a global match-anything rule would silently swallow
+# mistyped target names.
+version rev:
 	@v='$(REV)'; \
+	if [ -z "$$v" ] && [ "$@" = version ]; then echo "$(VERSION)"; exit 0; fi; \
 	if ! echo "$$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
-	  echo "usage: make rev X.Y.Z        (for example: make rev 1.2.0)"; \
+	  echo "usage: make $@ X.Y.Z        (for example: make $@ 1.2.0)"; \
 	  echo "current version: $(VERSION)"; \
 	  exit 1; \
 	fi; \

@@ -7,8 +7,12 @@
 //
 // Capture path: FEAR2.exe statically imports Direct3DCreate9, so we patch that
 // one import-table slot, then walk COM vtables from the object it returns:
-//   Direct3DCreate9 -> IDirect3D9::CreateDevice (slot 16)
-//                   -> IDirect3DDevice9::Reset (16) / EndScene (42)
+//   Direct3DCreate9 -> IDirect3D9::CreateDevice (slot 16, in place: with the
+//                      Steam overlay that object is the overlay's own wrapper)
+//                   -> IDirect3DDevice9::Reset (16) / EndScene (42) - on Windows
+//                      in a vtable of the game's device's own (adopt.cpp: the
+//                      overlay hooks what the device class's Reset points to, at
+//                      every CreateDevice), under Wine in the class's vtable.
 
 #include "overlay.h"
 
@@ -17,9 +21,11 @@
 
 #include <cstring>
 
+#include "adopt.h"
 #include "awards.h"
 #include "awards_table.h"
 #include "callbacks.h"
+#include "crash.h"
 #include "imgui.h"
 #include "backends/imgui_impl_dx9.h"
 #include "backends/imgui_impl_win32.h"
@@ -44,6 +50,11 @@ Create9Fn g_orig_create9 = nullptr;
 CreateDeviceFn g_orig_create_device = nullptr;
 EndSceneFn g_orig_end_scene = nullptr;
 ResetFn g_orig_reset = nullptr;
+
+constexpr int kReset = 16, kEndScene = 42;
+// IDirect3DDevice9's slots (IDirect3DDevice9Ex has 134); an adopted device's
+// copy has as many as can be read, up to kDeviceCopy.
+constexpr int kDeviceSlots = 119, kDeviceCopy = 192;
 
 IDirect3DDevice9* g_device = nullptr;
 HWND g_hwnd = nullptr;
@@ -404,6 +415,11 @@ void init_imgui(IDirect3DDevice9* device) {
 }
 
 HRESULT __stdcall hk_end_scene(IDirect3DDevice9* device) {
+  const auto orig = reinterpret_cast<EndSceneFn>(
+      adopt::original(device, kEndScene, reinterpret_cast<void*>(g_orig_end_scene)));
+  // An EndScene that comes back in while ours is on its way on (another tool's
+  // hook calling the device's vtable again) is the same frame: straight through.
+  if (adopt::calling_on()) return orig(device);
   init_imgui(device);
 
   hooks::poll();
@@ -431,12 +447,18 @@ HRESULT __stdcall hk_end_scene(IDirect3DDevice9* device) {
       state->Release();
     }
   }
-  return g_orig_end_scene(device);
+  adopt::CallingOn on;
+  return orig(device);
 }
 
 HRESULT __stdcall hk_reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pp) {
   if (g_imgui_ready) ImGui_ImplDX9_InvalidateDeviceObjects();
-  HRESULT hr = g_orig_reset(device, pp);
+  const auto orig = reinterpret_cast<ResetFn>(adopt::original(device, kReset, reinterpret_cast<void*>(g_orig_reset)));
+  HRESULT hr;
+  {
+    adopt::CallingOn on;
+    hr = orig(device, pp);
+  }
   if (g_imgui_ready) ImGui_ImplDX9_CreateDeviceObjects();
   return hr;
 }
@@ -447,18 +469,40 @@ HRESULT __stdcall hk_create_device(IDirect3D9* self, UINT adapter, D3DDEVTYPE ty
   HRESULT hr = g_orig_create_device(self, adapter, type, focus, flags, pp, out);
   if (FAILED(hr) || !out || !*out) return hr;
 
-  g_device = *out;
-  if (focus) g_hwnd = focus;
-  else if (pp && pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;
-
-  auto vt = mem::read<uintptr_t>(reinterpret_cast<uintptr_t>(g_device));
-  if (!g_orig_end_scene) {
+  IDirect3DDevice9* device = *out;
+  HWND hwnd = focus ? focus : pp ? pp->hDeviceWindow : nullptr;
+  auto vt = mem::read<uintptr_t>(reinterpret_cast<uintptr_t>(device));
+  if (adopt::enabled()) {
+    if (!adopt::game_window(hwnd)) {
+      adopt::leave_alone("a D3D9 device", "CreateDevice", hwnd);
+      return hr;
+    }
+    static const adopt::Hook hooks[] = {{kEndScene, reinterpret_cast<void*>(&hk_end_scene)},
+                                        {kReset, reinterpret_cast<void*>(&hk_reset)}};
+    // What the hooks fall back on: the class's functions (its vtable is left alone).
+    if (!g_orig_end_scene) {
+      g_orig_end_scene = mem::read<EndSceneFn>(vt + kEndScene * sizeof(void*));
+      g_orig_reset = mem::read<ResetFn>(vt + kReset * sizeof(void*));
+    }
+    const int copied = adopt::take(device, kDeviceSlots, kDeviceCopy, hooks, 2);
+    char where[MAX_PATH + 32], win[128];
+    describe_address(reinterpret_cast<void*>(vt), where, sizeof(where));
+    adopt::describe_window(hwnd, win, sizeof(win));
+    if (!copied) {
+      logf("ERROR: the game's D3D9 device %p (%s) could not be adopted (its vtable at %s) - no panel", device, win, where);
+      return hr;
+    }
+    logf("D3D9 device %p (%s) adopted - a vtable of its own with EndScene/Reset (%d slots copied; the class's at %s)",
+         device, win, copied, where);
+  } else if (!g_orig_end_scene) {
     g_orig_end_scene = reinterpret_cast<EndSceneFn>(
-        mem::hook_vtable(vt, 42, reinterpret_cast<void*>(&hk_end_scene)));
+        mem::hook_vtable(vt, kEndScene, reinterpret_cast<void*>(&hk_end_scene)));
     g_orig_reset =
-        reinterpret_cast<ResetFn>(mem::hook_vtable(vt, 16, reinterpret_cast<void*>(&hk_reset)));
-    logf("captured D3D9 device %p (hwnd=%p); hooked EndScene/Reset", g_device, g_hwnd);
+        reinterpret_cast<ResetFn>(mem::hook_vtable(vt, kReset, reinterpret_cast<void*>(&hk_reset)));
+    logf("captured D3D9 device %p (hwnd=%p); hooked EndScene/Reset", device, hwnd);
   }
+  g_device = device;
+  if (hwnd) g_hwnd = hwnd;
   return hr;
 }
 
@@ -505,8 +549,12 @@ void uninstall() {
     g_orig_wndproc = nullptr;
   }
 
-  // Restore the device vtable if the device is still alive.
-  if (g_device && !IsBadReadPtr(g_device, sizeof(void*))) {
+  // The adopted device's copy gets the class's functions back (the copy is the
+  // mod's own, so this holds whether or not the device is still alive);
+  // otherwise restore the class's vtable if the device is still alive.
+  if (adopt::enabled()) {
+    adopt::unhook_all();
+  } else if (g_device && !IsBadReadPtr(g_device, sizeof(void*))) {
     auto vt = mem::read<uintptr_t>(reinterpret_cast<uintptr_t>(g_device));
     if (vt && !IsBadReadPtr(reinterpret_cast<void*>(vt), 64 * sizeof(void*))) {
       if (g_orig_end_scene)
