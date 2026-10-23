@@ -10,15 +10,19 @@
 //   Direct3DCreate9 -> IDirect3D9::CreateDevice (slot 16, in place: with the
 //                      Steam overlay that object is the overlay's own wrapper)
 //                   -> IDirect3DDevice9::Reset (16) / EndScene (42) - on Windows
-//                      in a vtable of the game's device's own (adopt.cpp: the
-//                      overlay hooks what the device class's Reset points to, at
-//                      every CreateDevice), under Wine in the class's vtable.
+//                      where the device's vtable is when Windows' d3d9 gave the
+//                      device one of its own ("a vtable the device keeps"
+//                      below), else in a copy of the class's that is the game's
+//                      device's own (adopt.cpp: the overlay hooks what the
+//                      device class's Reset points to, at every CreateDevice);
+//                      under Wine in the class's vtable.
 
 #include "overlay.h"
 
 #include <windows.h>
 #include <d3d9.h>
 
+#include <cstdio>
 #include <cstring>
 
 #include "adopt.h"
@@ -45,13 +49,15 @@ using CreateDeviceFn = HRESULT(__stdcall*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, 
                                            D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
 using EndSceneFn = HRESULT(__stdcall*)(IDirect3DDevice9*);
 using ResetFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+using BeginStateBlockFn = HRESULT(__stdcall*)(IDirect3DDevice9*);
 
 Create9Fn g_orig_create9 = nullptr;
 CreateDeviceFn g_orig_create_device = nullptr;
 EndSceneFn g_orig_end_scene = nullptr;
 ResetFn g_orig_reset = nullptr;
+BeginStateBlockFn g_orig_begin_state_block = nullptr;
 
-constexpr int kReset = 16, kEndScene = 42;
+constexpr int kReset = 16, kEndScene = 42, kBeginStateBlock = 60;
 // IDirect3DDevice9's slots (IDirect3DDevice9Ex has 134); an adopted device's
 // copy has as many as can be read, up to kDeviceCopy.
 constexpr int kDeviceSlots = 119, kDeviceCopy = 192;
@@ -414,6 +420,140 @@ void init_imgui(IDirect3DDevice9* device) {
        g_hwnd, g_toggle_key);
 }
 
+// ------------------------------------------------ a vtable the device keeps
+// Windows' d3d9.dll gives each device a vtable of its own, inside the device
+// (32-bit d3d9.dll of Windows 11 build 26200: as it makes the device it copies
+// the class's 175 slots to +0x2F5C and points the device there). Two things
+// rely on the device staying on that table:
+//  - d3d9 keeps rewriting it. BeginStateBlock and a Reset that fails copy the
+//    class's first 119 slots back over it, and fast paths go into 17 of the
+//    state-setting slots. D3DX records state blocks through the device's
+//    vtable (d3dx9_40.dll: BeginStateBlock, SetViewport, EndStateBlock): on a
+//    copy the device would go on calling the fast paths while d3d9 records.
+//  - The Windows shim engine (apphelp.dll; FEAR2.exe got DWM8And16BitMitigation
+//    on its first launch on the laptop) hooks a COM object in place in the vtable it has -
+//    QueryInterface and Release on every object, CreateAdditionalSwapChain and
+//    Reset on a device - and each hook looks up what to call on by the vtable
+//    the object points to at the call. Found nothing, QueryInterface fails
+//    (E_NOINTERFACE), Release does nothing, and Reset and
+//    CreateAdditionalSwapChain call address 0.
+// 1.0.1 moved the game's device to a copy of the mod's (adopt.cpp), and the
+// game crashed at its first start on Windows, 2 s after: a null D3DX effect in
+// its renderer (2026-10-22). So a device whose vtable is in no module - its own
+// - is hooked where it is. That table is the device's alone, so no other device
+// shows the mod's functions to the Steam overlay, which is what the copy was
+// for. A class's vtable that something has hooked QueryInterface or Release in
+// place (the shim engine's mark) is hooked where it is as well, since a copy
+// would break that hooker for certain; there the mod's functions come out of
+// it while the next device is made (hk_create_device), so the overlay's pass
+// over that device does not find them either.
+//
+// After a call that can rewrite the table, a slot that changed during it gets
+// the mod's function back, calling on to what is there now.
+HRESULT __stdcall hk_end_scene(IDirect3DDevice9* device);
+HRESULT __stdcall hk_reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pp);
+HRESULT __stdcall hk_begin_state_block(IDirect3DDevice9* device);
+
+void** g_kept_vt = nullptr;  // the game's device's vtable, hooked where it is (Windows)
+bool g_kept_on_heap = false;  // its own: plain memory, rewritten on every BeginStateBlock
+constexpr int kKeptSlots[] = {kEndScene, kReset, kBeginStateBlock};
+
+void kept_write(void** entry, void* fn) {
+  if (g_kept_on_heap)
+    InterlockedExchangePointer(entry, fn);
+  else
+    mem::write<void*>(reinterpret_cast<uintptr_t>(entry), fn);
+}
+
+void* kept_hook_fn(int slot) {
+  switch (slot) {
+    case kEndScene: return reinterpret_cast<void*>(&hk_end_scene);
+    case kReset: return reinterpret_cast<void*>(&hk_reset);
+    default: return reinterpret_cast<void*>(&hk_begin_state_block);
+  }
+}
+
+void* kept_orig(int slot) {
+  switch (slot) {
+    case kEndScene: return reinterpret_cast<void*>(g_orig_end_scene);
+    case kReset: return reinterpret_cast<void*>(g_orig_reset);
+    default: return reinterpret_cast<void*>(g_orig_begin_state_block);
+  }
+}
+
+// The mod's function into `slot`; what the slot held is what it calls on to.
+void kept_hook(int slot) {
+  void* const fn = kept_hook_fn(slot);
+  void* const was = g_kept_vt[slot];
+  if (was == fn) return;
+  switch (slot) {
+    case kEndScene: g_orig_end_scene = reinterpret_cast<EndSceneFn>(was); break;
+    case kReset: g_orig_reset = reinterpret_cast<ResetFn>(was); break;
+    default: g_orig_begin_state_block = reinterpret_cast<BeginStateBlockFn>(was); break;
+  }
+  kept_write(&g_kept_vt[slot], fn);
+}
+
+// What each slot held goes back where the mod's function still is.
+void kept_unhook(void** vt) {
+  for (int slot : kKeptSlots)
+    if (void* orig = kept_orig(slot); orig && vt[slot] == kept_hook_fn(slot)) kept_write(&vt[slot], orig);
+}
+
+// The kept slots before a call that can rewrite the table (none for a device
+// that is not the one hooked where it is).
+struct KeptSlots {
+  bool kept = false;
+  void* fn[3] = {};
+};
+
+KeptSlots kept_before(IDirect3DDevice9* device) {
+  KeptSlots s;
+  s.kept = g_kept_vt && mem::read<void**>(reinterpret_cast<uintptr_t>(device)) == g_kept_vt;
+  if (s.kept)
+    for (int i = 0; i < 3; ++i) s.fn[i] = g_kept_vt[kKeptSlots[i]];
+  return s;
+}
+
+void kept_after(const KeptSlots& before, const char* call) {
+  if (!before.kept || !g_kept_vt) return;
+  int rewritten = 0;
+  for (int i = 0; i < 3; ++i)
+    if (g_kept_vt[kKeptSlots[i]] != before.fn[i]) {
+      kept_hook(kKeptSlots[i]);
+      ++rewritten;
+    }
+  static volatile LONG logged = 0;
+  if (!rewritten) return;
+  const LONG n = InterlockedIncrement(&logged);
+  if (n <= 3)
+    logf("%s rewrote the device's vtable - its EndScene/Reset are the mod's again%s", call,
+         n == 3 ? " (no more of these logged)" : "");
+}
+
+// Why the game's device keeps its vtable, or null for a copy (adopt.cpp).
+const char* keeps_vtable(void** vt) {
+  const HMODULE owner = mem::module_of(vt);
+  if (!owner) return "its own";
+  if (mem::module_of(vt[0]) != owner || mem::module_of(vt[2]) != owner)
+    return "its class's, QueryInterface/Release hooked in place by another module";
+  return nullptr;
+}
+
+// "; the Windows shim engine (apphelp.dll) has slots 0 2 13 16", for the log.
+void shim_slots(void* const* vt, char* out, size_t n) {
+  out[0] = '\0';
+  const mem::Range shim = mem::module_range(GetModuleHandleA("apphelp.dll"));
+  if (shim.empty()) return;
+  size_t o = 0;
+  for (int s = 0; s < kDeviceSlots; ++s) {
+    if (!shim.contains(reinterpret_cast<uintptr_t>(vt[s]))) continue;
+    const int w = std::snprintf(out + o, n - o, "%s %d", o ? "" : "; the Windows shim engine (apphelp.dll) has slots", s);
+    if (w < 0 || static_cast<size_t>(w) >= n - o) break;
+    o += static_cast<size_t>(w);
+  }
+}
+
 HRESULT __stdcall hk_end_scene(IDirect3DDevice9* device) {
   const auto orig = reinterpret_cast<EndSceneFn>(
       adopt::original(device, kEndScene, reinterpret_cast<void*>(g_orig_end_scene)));
@@ -454,19 +594,35 @@ HRESULT __stdcall hk_end_scene(IDirect3DDevice9* device) {
 HRESULT __stdcall hk_reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pp) {
   if (g_imgui_ready) ImGui_ImplDX9_InvalidateDeviceObjects();
   const auto orig = reinterpret_cast<ResetFn>(adopt::original(device, kReset, reinterpret_cast<void*>(g_orig_reset)));
+  const KeptSlots before = kept_before(device);
   HRESULT hr;
   {
     adopt::CallingOn on;
     hr = orig(device, pp);
   }
+  kept_after(before, "Reset");
   if (g_imgui_ready) ImGui_ImplDX9_CreateDeviceObjects();
+  return hr;
+}
+
+// Only in a vtable the device keeps, where d3d9 rewrites the table (above).
+HRESULT __stdcall hk_begin_state_block(IDirect3DDevice9* device) {
+  const KeptSlots before = kept_before(device);
+  const HRESULT hr = g_orig_begin_state_block(device);
+  kept_after(before, "BeginStateBlock");
   return hr;
 }
 
 HRESULT __stdcall hk_create_device(IDirect3D9* self, UINT adapter, D3DDEVTYPE type, HWND focus,
                                    DWORD flags, D3DPRESENT_PARAMETERS* pp,
                                    IDirect3DDevice9** out) {
+  // A class's vtable hooked where it is would show the mod's functions to the
+  // Steam overlay's pass over the new device: out of it for the call.
+  void** const shared = g_kept_vt && !g_kept_on_heap ? g_kept_vt : nullptr;
+  if (shared) kept_unhook(shared);
   HRESULT hr = g_orig_create_device(self, adapter, type, focus, flags, pp, out);
+  if (shared)
+    for (int slot : kKeptSlots) kept_hook(slot);
   if (FAILED(hr) || !out || !*out) return hr;
 
   IDirect3DDevice9* device = *out;
@@ -477,23 +633,37 @@ HRESULT __stdcall hk_create_device(IDirect3D9* self, UINT adapter, D3DDEVTYPE ty
       adopt::leave_alone("a D3D9 device", "CreateDevice", hwnd);
       return hr;
     }
-    static const adopt::Hook hooks[] = {{kEndScene, reinterpret_cast<void*>(&hk_end_scene)},
-                                        {kReset, reinterpret_cast<void*>(&hk_reset)}};
-    // What the hooks fall back on: the class's functions (its vtable is left alone).
-    if (!g_orig_end_scene) {
-      g_orig_end_scene = mem::read<EndSceneFn>(vt + kEndScene * sizeof(void*));
-      g_orig_reset = mem::read<ResetFn>(vt + kReset * sizeof(void*));
-    }
-    const int copied = adopt::take(device, kDeviceSlots, kDeviceCopy, hooks, 2);
     char where[MAX_PATH + 32], win[128];
     describe_address(reinterpret_cast<void*>(vt), where, sizeof(where));
     adopt::describe_window(hwnd, win, sizeof(win));
-    if (!copied) {
-      logf("ERROR: the game's D3D9 device %p (%s) could not be adopted (its vtable at %s) - no panel", device, win, where);
-      return hr;
+    void** const table = reinterpret_cast<void**>(vt);
+    if (const char* whose = keeps_vtable(table)) {
+      char shim[160];
+      shim_slots(table, shim, sizeof(shim));
+      const uintptr_t inside = vt - reinterpret_cast<uintptr_t>(device);
+      if (inside < 0x10000) std::snprintf(where, sizeof(where), "+0x%X in the device", static_cast<unsigned>(inside));
+      g_kept_vt = table;
+      g_kept_on_heap = !mem::module_of(table);
+      for (int slot : kKeptSlots) kept_hook(slot);
+      logf("D3D9 device %p (%s) keeps its vtable (%s, at %s) - EndScene/Reset hooked in it%s", device, win, whose,
+           where, shim);
+    } else {
+      static const adopt::Hook hooks[] = {{kEndScene, reinterpret_cast<void*>(&hk_end_scene)},
+                                          {kReset, reinterpret_cast<void*>(&hk_reset)}};
+      // What the hooks fall back on: the class's functions (its vtable is left alone).
+      if (!g_orig_end_scene) {
+        g_orig_end_scene = mem::read<EndSceneFn>(vt + kEndScene * sizeof(void*));
+        g_orig_reset = mem::read<ResetFn>(vt + kReset * sizeof(void*));
+      }
+      const int copied = adopt::take(device, kDeviceSlots, kDeviceCopy, hooks, 2);
+      if (!copied) {
+        logf("ERROR: the game's D3D9 device %p (%s) could not be adopted (its vtable at %s) - no panel", device, win,
+             where);
+        return hr;
+      }
+      logf("D3D9 device %p (%s) adopted - a vtable of its own with EndScene/Reset (%d slots copied; the class's at %s)",
+           device, win, copied, where);
     }
-    logf("D3D9 device %p (%s) adopted - a vtable of its own with EndScene/Reset (%d slots copied; the class's at %s)",
-         device, win, copied, where);
   } else if (!g_orig_end_scene) {
     g_orig_end_scene = reinterpret_cast<EndSceneFn>(
         mem::hook_vtable(vt, kEndScene, reinterpret_cast<void*>(&hk_end_scene)));
@@ -550,10 +720,16 @@ void uninstall() {
   }
 
   // The adopted device's copy gets the class's functions back (the copy is the
-  // mod's own, so this holds whether or not the device is still alive);
-  // otherwise restore the class's vtable if the device is still alive.
+  // mod's own, so this holds whether or not the device is still alive); a
+  // vtable the device kept gets back what its slots held, once, while the game
+  // is still healthy (the device's own goes with the device); otherwise restore
+  // the class's vtable if the device is still alive.
   if (adopt::enabled()) {
     adopt::unhook_all();
+    if (void** vt = g_kept_vt) {
+      g_kept_vt = nullptr;
+      if (mem::readable(vt, (kBeginStateBlock + 1) * sizeof(void*))) kept_unhook(vt);
+    }
   } else if (g_device && !IsBadReadPtr(g_device, sizeof(void*))) {
     auto vt = mem::read<uintptr_t>(reinterpret_cast<uintptr_t>(g_device));
     if (vt && !IsBadReadPtr(reinterpret_cast<void*>(vt), 64 * sizeof(void*))) {

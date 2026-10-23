@@ -63,6 +63,14 @@ inline bool read_safe(uintptr_t target, T* out) {
   return true;
 }
 
+// The loaded module whose image holds `p`, or null (heap, stack, nothing).
+inline HMODULE module_of(const void* p) {
+  HMODULE m = nullptr;
+  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     static_cast<LPCSTR>(p), &m);
+  return m;
+}
+
 // The address range a loaded module's image covers.
 inline Range module_range(HMODULE m) {
   auto base = reinterpret_cast<uintptr_t>(m);

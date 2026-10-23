@@ -8,6 +8,7 @@
 
 #include "awards.h"
 #include "callbacks_table.h"
+#include "gameclient.h"
 #include "log.h"
 #include "mem.h"
 #include "overlay.h"
@@ -46,37 +47,57 @@ DWORD g_install_tick = 0;
 // Working out when the player is on the Awards screen.
 //
 // F.E.A.R. 2's Awards screen is pure ActionScript: opening it runs no game code
-// at all, so there is nothing to hook. What the bridge *does* show, measured
-// live, is:
+// at all, so there is nothing to hook. What the bridge does show, read from the
+// menu's ActionScript (interface\menu\main.gfx, the same in every patch):
 //
-//   main menu appears : SaveGame.GetCheckpointSaveData + Menu.IsDLCCorrupt
-//                       (and Menu.SetReturnMenu / PlayVideoLooping)
-//   pick a menu item  : Global.PlaySound("menu_select")
-//   go back           : Global.PlaySound("menu_back")
+//   - Menu.SetReturnMenu(layer) as a hub screen becomes active: the main menu
+//     (layer 1) every time it does, New Game (10), and the custom-world and
+//     multiplayer menus. Nothing else marks the main menu reliably.
+//   - Picking a main-menu item runs its callback first, then
+//     Global.PlaySound("menu_select"). Continue (LoadCheckpointSave), Quit
+//     (Global.Exit) and New Game (IsConnectedOnline) call into the game in that
+//     callback. Options and Awards only start the screen change.
+//   - The screen change is a fade on the game's clock: 300 ms out
+//     (MenuManagers.CMainMenu.FADE_OUT_TIME), then a frame. The new screen's
+//     OnActivate and OnUpdate run only after it. New Game calls
+//     Menu.SetReturnMenu(10) there, and Options calls Menu.CancelAttractMode
+//     every frame. The Awards screen never calls the game.
+//   - Global.GetAccumulatedTime is called once per menu frame.
+//   - Leaving a screen plays "menu_back" (PopLayer, the only place it is played).
+//   - Every key press calls Menu.CancelAttractMode once per text box in the
+//     menus (MenuComponents.CInput's key listener; 11 of them, traced on the
+//     laptop), right after the menu's own handling of the key: picking Awards
+//     with Enter is followed in the same frame by 11 of them.
 //
-// Every other main-menu destination announces itself - Options, Multiplayer,
-// New Game and Load all call into C++ as they open. Awards is the one that
-// stays silent. So: a "menu_select" from the main menu that is followed by
-// nothing else means the player opened Awards.
+// So a "menu_select" on the main menu, with no other call since the last menu
+// frame, followed by the fade and eight menu frames with no call into the game,
+// is the Awards screen. Menu.CancelAttractMode does not count as a call until it
+// comes three frames running, which Options' OnUpdate does and a key press
+// (all in one frame) does not.
 //
-// This is inference, not a signal from the game, and it is deliberately
-// conservative: anything else calling in cancels it, and returning to the main
-// menu always clears it.
-enum class Nav { kMainMenu, kPending, kAwards, kOtherScreen };
-Nav g_nav = Nav::kMainMenu;
+// Until 2026-10-22 the main menu was marked by SaveGame.GetCheckpointSaveData,
+// which runs once while the menu is built (and on Mission Select every frame).
+// On a first run the brightness screen comes before the main menu, and
+// confirming it used up the inference before the main menu ever appeared: the
+// Awards screen went undetected on Windows. The wait was also 350 ms of quiet,
+// which is less than the fade plus a frame at 30 fps, so Options could pass it.
+enum class Nav { kUnknown, kMainMenu, kPending, kAwards, kOtherScreen };
+Nav g_nav = Nav::kUnknown;
+constexpr int kMainMenuLayer = 1;  // Enum.LayerId.MAIN_MENU
+constexpr DWORD kFadeMs = 300;     // MenuManagers.CMainMenu.FADE_OUT_TIME
+constexpr int kQuietFrames = 8;    // menu frames after the fade with no call into the game
+constexpr int kAttractFrames = 3;  // frames running with Menu.CancelAttractMode: a screen's OnUpdate
+constexpr DWORD kStaleMs = 3000;   // the menu stopped running before then: a level loading
 DWORD g_pending_tick = 0;
-constexpr DWORD kSilenceMs = 350;
+int g_quiet_frames = 0;
+int g_frames = 0;                  // menu frames so far
+int g_attract_frame = -2;          // the last frame with a Menu.CancelAttractMode
+int g_attract_run = 0;             // frames running with one, up to that frame
+bool g_called_this_frame = false;  // a call into the game since the last menu frame
 
-bool is_sound(int index) {
-  return !std::strcmp(kMenuCallbacks[index].name, "Global.PlaySound");
-}
-bool is_timer(int index) {
-  return !std::strcmp(kMenuCallbacks[index].name, "Global.GetAccumulatedTime");
-}
-bool is_main_menu_marker(int index) {
-  const char* n = kMenuCallbacks[index].name;
-  return !std::strcmp(n, "SaveGame.GetCheckpointSaveData") || !std::strcmp(n, "Menu.IsDLCCorrupt");
-}
+bool named(int index, const char* name) { return !std::strcmp(kMenuCallbacks[index].name, name); }
+bool is_sound(int index) { return named(index, "Global.PlaySound"); }
+bool is_timer(int index) { return named(index, "Global.GetAccumulatedTime"); }
 
 const char* sound_name(const void* args, int argc) {
   if (!args || argc <= 0) return nullptr;
@@ -87,17 +108,43 @@ const char* sound_name(const void* args, int argc) {
   return reinterpret_cast<const char*>(sp);
 }
 
-void note_navigation(int index, const void* args, int argc) {
-  if (is_timer(index)) return;
+// args[0] as a whole number, or -1 if it is not a number.
+int number_arg(const void* args, int argc) {
+  if (!args || argc <= 0) return -1;
+  auto p = reinterpret_cast<uintptr_t>(args);
+  if (IsBadReadPtr(reinterpret_cast<const void*>(p), 16)) return -1;
+  if (mem::read<int>(p) != gc::kGfxValueTypeNumber) return -1;
+  return static_cast<int>(mem::read<double>(p + gc::kGfxValueNumberOffset));
+}
 
-  // The game says so itself before it starts tearing the renderer down.
-  if (!std::strcmp(kMenuCallbacks[index].name, "Global.Exit")) {
-    overlay::on_game_exiting();
+void note_navigation(int index, const void* args, int argc) {
+  if (is_timer(index)) {
+    ++g_frames;
+    g_called_this_frame = false;
+    if (g_nav == Nav::kPending && GetTickCount() - g_pending_tick >= kFadeMs) ++g_quiet_frames;
     return;
   }
 
-  if (is_main_menu_marker(index)) {
-    g_nav = Nav::kMainMenu;
+  // The game says so itself before it starts tearing the renderer down.
+  if (named(index, "Global.Exit")) overlay::on_game_exiting();
+
+  if (named(index, "Menu.CancelAttractMode")) {
+    if (g_attract_frame == g_frames) return;  // more of the same frame: a key press
+    g_attract_run = g_attract_frame == g_frames - 1 ? g_attract_run + 1 : 1;
+    g_attract_frame = g_frames;
+    if (g_attract_run < kAttractFrames || g_nav != Nav::kPending) return;
+    g_nav = Nav::kOtherScreen;
+    logf("menu: Menu.CancelAttractMode %d frames running, %lu ms after the pick - not the Awards screen",
+         g_attract_run, GetTickCount() - g_pending_tick);
+    return;
+  }
+
+  if (named(index, "Menu.SetReturnMenu")) {
+    g_called_this_frame = true;
+    const int layer = number_arg(args, argc);
+    const Nav now = layer == kMainMenuLayer ? Nav::kMainMenu : Nav::kOtherScreen;
+    if (now != g_nav) logf("menu: screen %d is up%s", layer, layer == kMainMenuLayer ? " (the main menu)" : "");
+    g_nav = now;
     return;
   }
 
@@ -105,20 +152,28 @@ void note_navigation(int index, const void* args, int argc) {
     const char* s = sound_name(args, argc);
     if (!s) return;
     if (!_stricmp(s, "menu_select")) {
-      // Only a selection made *from* the main menu can be the Awards button.
-      if (g_nav == Nav::kMainMenu) {
+      // The selection's own callback ran just before this: only one that
+      // called nothing can be the Awards button.
+      if (g_nav == Nav::kMainMenu && !g_called_this_frame) {
         g_nav = Nav::kPending;
         g_pending_tick = GetTickCount();
+        g_quiet_frames = 0;
+        logf("menu: a pick on the main menu - watching the screen it opens");
       }
     } else if (!_stricmp(s, "menu_back")) {
-      g_nav = Nav::kMainMenu;
+      // A screen is being left. The main menu says so itself once it is back.
+      if (g_nav != Nav::kMainMenu) g_nav = Nav::kOtherScreen;
     }
     return;
   }
 
   // Any other call means the screen being opened identified itself, so it is
   // not the Awards screen.
-  if (g_nav == Nav::kPending) g_nav = Nav::kOtherScreen;
+  g_called_this_frame = true;
+  if (g_nav != Nav::kPending) return;
+  g_nav = Nav::kOtherScreen;
+  logf("menu: %s %lu ms after the pick (%d frames past the fade) - not the Awards screen", kMenuCallbacks[index].name,
+       GetTickCount() - g_pending_tick, g_quiet_frames);
 }
 
 // Best-effort decode of a Scaleform value: a 4-byte type tag, then the payload
@@ -211,9 +266,14 @@ const char* last() { return g_last; }
 bool on_awards_screen() { return g_nav == Nav::kAwards; }
 
 void poll() {
-  if (g_nav == Nav::kPending && GetTickCount() - g_pending_tick >= kSilenceMs) {
+  if (g_nav != Nav::kPending) return;
+  if (g_quiet_frames >= kQuietFrames) {
     g_nav = Nav::kAwards;
-    logf("no menu code ran after the selection - treating this as the Awards screen");
+    logf("no menu code ran in the %d menu frames after the screen change - treating this as the Awards screen",
+         g_quiet_frames);
+  } else if (GetTickCount() - g_pending_tick > kStaleMs) {
+    g_nav = Nav::kOtherScreen;
+    logf("menu: the menu stopped running after the selection - not the Awards screen");
   }
 }
 

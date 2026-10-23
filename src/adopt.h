@@ -4,8 +4,9 @@
 
 // Private vtables for the renderer object the panel hooks (the game's D3D9
 // device), so that no function of the mod's sits in a vtable another hooker
-// reads. Windows only: under Wine the class vtable is hooked as before. See
-// adopt.cpp for why.
+// reads. Windows only, and only for a class's vtable (a device with one of its
+// own keeps it - overlay.cpp): under Wine the class vtable is hooked as before.
+// See adopt.cpp for why.
 namespace f2au::adopt {
 
 // From DllMain: records the thread that loaded the mod (the game's primary

@@ -15,9 +15,10 @@ python3 tools/gen_awards.py --game-dir "$GAME_DIR"          # regenerate src/awa
 python3 tools/gen_awards.py --game-dir "$GAME_DIR" --print   # inspect the award table
 ```
 
-`tests/test_adopt.cpp` runs the D3D9 hooks under Wine with the Steam overlay's way of hooking played
-by the test (build and run commands in its header; `F2AU_ADOPT=1` makes the proxy take the Windows
-path under Wine). See "The panel's hooks on Windows".
+`tests/test_adopt.cpp` runs the D3D9 hooks under Wine. The test plays the Steam overlay's way of
+hooking, Windows' own d3d9 (a vtable per device) and the Windows shim engine (build and run commands
+in its header; `F2AU_ADOPT=1` makes the proxy take the Windows path under Wine). See "The panel's
+hooks on Windows".
 
 **The installed file must be named `LTMemory.dll`, exactly.** That is the spelling in FEAR2.exe's
 import table (`grep -aob 'LTMemory\.dll' FEAR2.exe`), and on a case-sensitive filesystem Wine
@@ -43,8 +44,9 @@ the new build prints before assuming the code is wrong.**
   reorder the array.
 - **Back up before touching a profile.** A malformed `.gps` makes the game reset the *entire*
   profile to defaults, not just awards.
-- **On Windows, no function of the mod's in a vtable another hooker reads** (The panel's hooks on
-  Windows).
+- **On Windows, no function of the mod's in a vtable another hooker reads, and never move a device
+  off the vtable it has.** Windows' d3d9 gives each device its own vtable and rewrites it, and the shim
+  engine finds its hooks by it. See "The panel's hooks on Windows".
 
 ## What the game does
 
@@ -200,12 +202,76 @@ each have exactly one caller and all run once during menu construction at boot; 
 produces no achievement traffic at all (verified at runtime). So a sweep of `IsAchievementComplete`
 cannot be used as a screen signal.
 
-What Flash *does* report is `Menu.StateChanged(id)` on every screen change. ActionScript reaches
-C++ through a table of 12-byte `{const char* name, void* handler, u8 flag}` rows; the row at
-`0x1F6B80`/`0x1F6B84` is that callback (handler RVA `0x94A0`, `__stdcall(void*, GFxValue*, int)`,
-reading `args[0]` as type 3 with the double at `+0x08`). Swapping the handler pointer is a clean
-data patch. The id of the Awards screen is an ActionScript enum value and is not in the binary, so
-the mod learns it from the player instead.
+ActionScript reaches C++ through a table of 12-byte `{const char* name, void* handler, u8 flag}`
+rows (`src/callbacks_table.h`, all 163 hooked). Each handler is `__stdcall(void*, GFxValue*, int)`;
+a GFx value has its type tag at `+0x00` (3 = number, 4 = string) and the payload at `+0x08`.
+`Menu.StateChanged` (row `0x1F6B80`/`0x1F6B84`, handler `0x94A0`) is **not** a screen signal. The
+ActionScript defines a wrapper for it but nothing calls it, and no log has ever had a `menu state ->`
+line. Its hook only logs.
+
+**What the menu's ActionScript does.** This was read from `interface\menu\main.gfx` (AS2) in the
+latest bundle, `_postrelease\pc\interface\mainmenu_titleupdate.bndl` (`Layer01_v103.Arch01`). The
+base, v101 and `interface\_postrelease\pc\mainmenu_v102.bndl` copies agree on everything below. The
+title update adds `Menu.IsDLCCorrupt` and `UpdatePrompts` (`IsConnectedOnline`) to
+`CMainMenu.InitComponents`, run once while the menu is built. `tools/menu_as.py --list` shows the
+bundles; `tools/menu_as.py <bundle> <movie>` disassembles one.
+
+- **The PC main menu** (`MenuLayers.CMainMenu`):
+  - New Game → layer `NEWGAMEMENU` 10.
+  - Continue → `cb_LoadLastSave` → `SaveGame.LoadCheckpointSave`.
+  - Options → `OPTIONS` 2.
+  - Achievements → `ACHIEVEMENTS` 28.
+  - Quit → `cb_QuitGame` → `Global.Exit`.
+  - A Load button (`LOADMENU` 23) is defined `AS_NONE`, and no layer class exists for it.
+- **Other layer ids** (`Enum.LayerId`): `MAIN_MENU` 1, `GAMMA` 27 (the first-run brightness screen).
+- **Selecting.** `CButton.HandleSelect` runs the button's callback first (`cb_PushLayer` →
+  `Globals._MM.PushLayer(id)`). Only then does it call `PlaySelectSound`: the key `'SELECT'` becomes
+  `MENU_SELECT`, i.e. `Global.PlaySound("menu_select")`.
+- **The screen change** (`MenuManagers.CMainMenu`):
+  - `StartTransition` calls the old layer's `OnTransitionFrom` and the new one's `OnTransitionTo` at
+    once, before the select sound.
+  - Then comes a fade on the game clock: `FADE_OUT_TIME` 300 ms, then one frame. (The fade-in divides
+    by `FADE_TOTAL_TIME` from a start time it has just reset to 0, so it ends at once.)
+  - Only then do the new layer's `OnActivate` and, from the next frame, its `OnUpdate` run.
+- **`Menu.SetReturnMenu(this._LayerId)`** is called in `OnActivate` by the hub layers: CMainMenu (1),
+  CNewGameMenu (10), CCustomWorldMenu (18), CMPLanPlay (11), CMPInternetPlay (14) and CMPRankedPlay
+  (12). The game keeps it at `gameclient+0x1FDD44` (handler `0x95A0`).
+- **Leaving.** `PopLayer` is the only place `menu_back` is played, and only when the stack is deeper
+  than one.
+- **Every frame**, the root `onEnterFrame` → `LokiMenuEvents.OnUpdate` calls
+  `Global.GetAccumulatedTime` once. It also calls `Menu.CancelAttractMode`, but only while a message
+  box is up or on the gamma screen.
+- **Every key press** calls `Menu.CancelAttractMode` once per text box in the menus, right after the
+  menu's own handling of the key. Each `MenuComponents.CInput` registers a key listener; the laptop
+  trace showed 11 calls per press. So picking Awards with Enter is followed, in the same frame, by 11
+  of them.
+- **What other screens call:**
+  - Options (`COptionsMenu.OnUpdate`) calls `Menu.CancelAttractMode` every frame.
+  - The Awards layer (`CAchievements`) calls nothing. Its `OnTransitionTo` sets the title through
+    Scaleform's translator and runs `PopulateTable`; its `OnUpdate` is `UpdateView`.
+- **`SaveGame.GetCheckpointSaveData`** is called by `CMainMenu.InitComponents` (once, while the menu is
+  built), by `CSPMenu.OnTransitionFrom`, and by `CMissionSelect.OnUpdate` every frame.
+
+**The inference** (`callbacks.cpp`):
+
+1. `SetReturnMenu(1)` puts it on the main menu; any other id means another screen.
+2. A `menu_select` there counts as a candidate only if no other call came since the last menu frame.
+   That rules out Continue, New Game and Quit, whose callbacks call the game first.
+3. If the fade and then eight menu frames (counted by `GetAccumulatedTime`) pass with no call into the
+   game, it is the Awards screen. That rules out New Game (`SetReturnMenu(10)` at `OnActivate`).
+4. `Menu.CancelAttractMode` counts as a call only when it comes in three frames running. Options'
+   `OnUpdate` does that; a key press, whose calls all land in one frame, does not.
+5. A selection after which the menu stops running for 3 s (a level loading) is dropped.
+6. `menu_back` leaves the Awards screen.
+
+Until 2026-10-22 the main menu was marked by `GetCheckpointSaveData`, and it needed 350 ms of quiet
+after the select. That failed on the first Windows run, which went through the brightness screen:
+confirming that screen used the inference up before the main menu appeared, so Awards was never
+detected. The 350 ms is also shorter than the fade plus a frame at 30 fps, which let Options pass.
+Then, on the laptop, the key-press `CancelAttractMode` burst cancelled every keyboard pick.
+`TraceMenuCallbacks = 1` found it; mouse picks make no burst.
+
+`tests/test_menu_nav.cpp` plays these sequences against the real state machine, keyboard included.
 
 ### The Awards screen is Scaleform, and the channel is one-way
 
@@ -264,14 +330,87 @@ writing a vtable through `g_device`. Under Wine the class vtable is hooked as be
 above is unchanged and exits clean under Wine in every case (`hooks removed cleanly`), unlike the
 Fear3 mods' teardown (which never finished there). `tests/test_adopt.cpp` plays the overlay: 1.0.0
 loops at a second device's Reset (`LOOP`); the fix passes, and the Wine path still takes the class
-hook. Not yet seen in game on Windows.
+hook. The copy was first run in game on Windows on 2026-10-22, and it crashed the game at start. The
+next section explains why, and what replaced the copy for Windows' own d3d9.
+
+### A device keeps its vtable: Windows' d3d9 and the shim engine (2026-10-22)
+
+1.0.1 crashed the game at its first start on Windows. The machine was the laptop: Windows 11 build
+26200, Intel UHD 620 + MX150, Steam overlay on.
+
+- **The mod's log** ended normally ("BuildAchievementList called"). The give-away was earlier:
+  "the class's at 0aa1929c (no module)" - the device's vtable was on the heap.
+- **WER's dump** showed an access violation reading 0x10 at `FEAR2.exe+0x218DEA`, on the main
+  thread. It came 2.1 s after the device was adopted, before `PushAchievementsToFlash`.
+- **The faulting code** is `cmp dword [esi+10h],0` with `this` null, in an engine class wrapping an
+  `ID3DXEffect` at `+0x10`. The functions beside it call the effect's `OnResetDevice`/`OnLostDevice`
+  (vtable +0x118/+0x114). No frame of the mod's was on the stack.
+
+Two things on Windows rely on a device keeping the vtable it has.
+
+**Windows' d3d9.dll gives each device a vtable of its own.** This is the 32-bit d3d9.dll of build
+26200 (`SysWOW64`, hash 7678a845).
+
+- As the device is made (0x1008CA0C), d3d9 saves the class's vtable at `+0x2F58`, copies its 175
+  slots to `+0x2F5C` and points the device there.
+- d3d9 keeps rewriting that table. `BeginStateBlock` (slot 60, 0x10124020) and a failed Reset
+  (0x100E156D) copy the class's first 119 slots back over it.
+- A fast-path patcher (0x1007D851) writes slots 49, 57, 65, 67, 69, 89, 92, 94, 96, 98, 100, 102,
+  104, 107, 109, 111 and 113.
+- D3DX records state blocks through the device's vtable (d3dx9_40.dll: `BeginStateBlock`,
+  `SetViewport`, `EndStateBlock`).
+
+**The Windows shim engine knows a COM object by its vtable.** On its first launch on the laptop,
+FEAR2.exe got apphelp.dll's `DWM8And16BitMitigation`. On the second launch apphelp.dll was not loaded
+at all. Why is not known; it is not a setting on the laptop, whose only layer for FEAR2.exe is
+`HIGHDPIAWARE`. So a player may or may not have it.
+
+- The shim hooks the `Direct3DCreate9(Ex)` imports and `IDirect3D9(Ex)::CreateDevice(Ex)`.
+- On a device it hooks `CreateAdditionalSwapChain` 13 and `Reset` 16, where a 16-bit fullscreen back
+  buffer becomes X8R8G8B8. On an Ex device it also hooks `ResetEx` 132.
+- On every object it hooks, it hooks `QueryInterface` 0 and `Release` 2 as well.
+- A slot is hooked in place, in the vtable the object has (0x10083D62 records vtable, slot, original
+  and hook). Each hook finds its original by the vtable the object points to at the call
+  (0x10083A9C).
+- When it finds nothing, `QueryInterface` returns E_NOINTERFACE, `Release` returns 0 and releases
+  nothing, and `Reset` and `CreateAdditionalSwapChain` call address 0.
+- The Steam overlay, asking GetProcAddress for `Direct3DCreate9`, gets apphelp's hook ("returned
+  wrong module ... proceeding anyway") and detours that.
+
+So adoption broke the device twice over:
+
+- the device ran on a stale copy of a table that d3d9 switches implementations in;
+- four shim hooks could no longer find their originals.
+
+Which of these the engine tripped over is not proven. Its code is encrypted on disk, and a minidump
+holds only 256 bytes of it. Both are cured by the device keeping its vtable. The rule is in
+`overlay.cpp`, "a vtable the device keeps":
+
+- **A device whose vtable is in no module (its own)** is hooked where it is: EndScene, Reset and
+  BeginStateBlock. After BeginStateBlock or Reset, a slot that changed during the call gets the mod's
+  function back, calling on to what is there now. The table is this device's alone, so the overlay's
+  pass over another device never sees the mod's functions.
+- **A class's vtable whose QueryInterface or Release another module has hooked in place** (the shim
+  engine's mark) is hooked where it is too. Around each later `CreateDevice` the mod's functions come
+  out of it, so the overlay's pass does not find them.
+- **Any other class's vtable** is adopted as before.
+
+`tests/test_adopt.cpp` plays both (`windows-d3d9`, `shim`). With the shim, 1.0.1 fails exactly as on
+the laptop: E_NOINTERFACE, Release 0, a failed Reset. The fix passes every mode.
+
+FEAR2.exe's code is SteamStub 2.0 (`.bind`). The header at VA 0x776204 is 0xD9 dwords, under a rolling
+XOR from key 0x5DA7F69A. It holds no AES key, so the code section cannot be decrypted from it alone.
+For the engine's code, take a full dump (WER `LocalDumps\FEAR2.exe`, DumpType 2) or read a running
+process.
 
 ## Data tooling
 
 `tools/ltar.py` reads `.Arch01` (LTAR v3) archives — verified byte-identical extraction.
 `tools/gadb.py` reads `.gamedb` (GADB v6). `tools/gen_awards.py` combines them to emit
 `src/awards_table.h`. Both readers were written for this project; the formats are documented in the
-module docstrings.
+module docstrings. `tools/menu_as.py` reads the `.bndl` bundles (BNDL v3) the menus come in and
+disassembles a movie's ActionScript (AS2: constant pools resolved, function bodies nested). That
+listing is how "What the menu's ActionScript does" above was worked out.
 
 Archive priority: `default.archcfg` lists the search path and **the last entry wins** — proven
 because `Loki.gamedb` exists in six archives and only the last-listed `Layer01_v103.Arch01` carries

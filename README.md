@@ -130,9 +130,10 @@ when you leave it. Set `AutoShow = 0` in the ini if you would rather it never di
 Detecting the screen takes an inference, because F.E.A.R. 2 gives no C++ notification when it opens
 — the award rows are pushed into Flash once while the menu is built, and the screen just renders
 that. That silence is itself the signal: of every entry on the main menu, the Awards screen is the
-only one that runs no game code at all. So the mod watches the ActionScript → C++ menu bridge, and
-when a selection is followed by 350 ms of complete quiet, that is the Awards screen. No screen id,
-no setup, and the same behaviour on every install.
+only one that runs no game code at all. So the mod watches the ActionScript → C++ menu bridge. When
+you pick an entry on the main menu, and the screen it opens stays quiet through its fade-in and a few
+frames more, that is the Awards screen. There is no screen id and no setup, and it behaves the same
+on every install, first run included.
 
 While you are on that screen the panel stays up — F8 will not dismiss it there, since it is
 re-opened on the next frame. Everywhere else F8 toggles it freely.

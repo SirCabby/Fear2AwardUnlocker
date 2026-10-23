@@ -18,6 +18,13 @@
 // ever finds the class's own functions. The hooks call on through the vtable the object had, as it is at
 // the time (original()), so a tool that hooks that vtable later still gets the
 // game's frames.
+//
+// Only for a device whose vtable is a class's, in a module. Windows' own d3d9
+// gives each device a vtable of its own, which d3d9 keeps rewriting and the
+// Windows shim engine knows the device by; moved off it, the game crashed at
+// start (2026-10-22). Such a device, and one whose class's QueryInterface or
+// Release another module has hooked in place, is hooked where it is: see "a
+// vtable the device keeps" in overlay.cpp.
 
 #include "adopt.h"
 
@@ -62,12 +69,7 @@ struct Lock {
   Lock& operator=(const Lock&) = delete;
 };
 
-HMODULE module_of(const void* p) {
-  HMODULE m = nullptr;
-  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                     static_cast<LPCSTR>(p), &m);
-  return m;
-}
+using mem::module_of;
 
 Entry* find(const void* obj) {  // under g_cs
   for (int i = 0; i < g_count; ++i)
@@ -103,8 +105,8 @@ void init() {
     HMODULE pinned = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                        reinterpret_cast<LPCSTR>(&init), &pinned);
-    logf("overlay: %s - the game's D3D9 device gets a vtable of its own as it is made; the class's vtable is left "
-         "alone (the Steam overlay hooks what that points to)",
+    logf("overlay: %s - the game's D3D9 device is hooked in the vtable Windows' d3d9 gives each device, or in a copy "
+         "of its class's (the Steam overlay hooks what a class's vtable points to)",
          wine ? "Wine, F2AU_ADOPT set" : "Windows");
   } else {
     logf("overlay: Wine - the device class vtable is hooked, as before");
